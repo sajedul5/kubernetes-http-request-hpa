@@ -9,7 +9,7 @@ spec:
   ingressClassName: traefik
 
   rules:
-    - host: prometheus.nip.io # <Change this to your public IP address or domain name>
+    - host: prometheus.nip.io # <Change this to your  domain name>
       http:
         paths:
           - path: /
