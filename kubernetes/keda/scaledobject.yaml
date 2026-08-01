@@ -7,20 +7,34 @@ spec:
   scaleTargetRef:
     name: nodejs-app
 
-  pollingInterval: 15
-  cooldownPeriod: 60
-
   minReplicaCount: 2
   maxReplicaCount: 10
 
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - type: Percent
+              value: 100
+              periodSeconds: 15
+
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+            - type: Percent
+              value: 50
+              periodSeconds: 60
+
   triggers:
-  - type: prometheus
-    metadata:
-      serverAddress: http://monitoring-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
+    - type: prometheus
+      metadata:
+        serverAddress: http://monitoring-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
 
-      metricName: http_requests_per_second
+        metricName: http_requests_per_second
 
-      query: |
-        sum(rate(http_requests_total[1m]))
+        query: |
+          sum(rate(http_requests_total{job="nodejs-service"}[1m]))
 
-      threshold: "20"
+        threshold: "20"
