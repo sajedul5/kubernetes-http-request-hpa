@@ -5,18 +5,16 @@ metadata:
   namespace: http-request-hpa
   annotations:
     traefik.ingress.kubernetes.io/router.entrypoints: web
-
 spec:
   ingressClassName: traefik
-
   rules:
-    - host: app.local
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: nodejs-service
-                port:
-                  number: 80
+  - host: app.34.55.132.38.nip.io
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: nodejs-service
+            port:
+              number: 80
