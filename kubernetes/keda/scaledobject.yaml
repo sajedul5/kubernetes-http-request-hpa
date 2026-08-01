@@ -1,0 +1,26 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: nodejs-http-scaler
+  namespace: http-request-hpa
+spec:
+  scaleTargetRef:
+    name: nodejs-app
+
+  pollingInterval: 15
+  cooldownPeriod: 60
+
+  minReplicaCount: 2
+  maxReplicaCount: 10
+
+  triggers:
+  - type: prometheus
+    metadata:
+      serverAddress: http://monitoring-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
+
+      metricName: http_requests_per_second
+
+      query: |
+        sum(rate(http_requests_total[1m]))
+
+      threshold: "20"
