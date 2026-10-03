@@ -1,87 +1,89 @@
-# Kubernetes HTTP-Request Autoscaling with KEDA, Prometheus & Grafana
+# Kubernetes Autoscaling on HTTP Requests (KEDA + Prometheus + Grafana)
 
-A hands-on DevOps reference project demonstrating **event-driven pod autoscaling**
-based on live HTTP request metrics, using **KEDA** on top of Kubernetes **HPA**,
-with full observability via **Prometheus** and **Grafana**.
+**In one sentence:** when more people use the app, Kubernetes starts more
+copies (pods) of it automatically; when traffic drops, it removes them.
 
-Designed for local study, single-VM R&D, and as a template for production-grade
-autoscaling setups.
+Most autoscaling looks at CPU. This project scales on **requests per second**
+— the thing that actually makes users wait. It runs on one laptop or VM, so
+you can learn the whole flow for free. An optional part shows the same idea
+for **GPU workloads** (AI models), where it saves the most money.
 
----
-
-## Table of Contents
-
-1. [Architecture](#architecture)
-2. [Prerequisites](#prerequisites)
-3. [Cluster Setup](#1-cluster-setup)
-4. [Clone the Application Repo](#2-clone-the-application-repo)
-5. [Monitoring Stack Setup](#3-monitoring-stack-setup)
-6. [Deploy the Application](#4-deploy-the-application)
-7. [Install KEDA](#5-install-keda)
-8. [Load Testing](#6-load-testing)
-9. [Observe Autoscaling in Real Time](#7-observe-autoscaling-in-real-time)
-10. [GPU Inference Autoscaling (Optional)](#8-gpu-inference-autoscaling-optional)
-11. [Why KEDA? (Deep Dive)](#why-keda-deep-dive)
-12. [Cost Benefit of This Architecture](#cost-benefit-of-this-architecture)
-13. [Resource Utilization](#resource-utilization)
-14. [Why This Matters for Production](#why-this-matters-for-production)
-15. [Study Notes / Learning Path](#study-notes--learning-path)
-16. [Resources & References](#resources--references)
-17. [Troubleshooting](#troubleshooting)
+| You will learn | Tool |
+|---|---|
+| Run a Kubernetes cluster on one machine | k3s |
+| Collect and graph app metrics | Prometheus, Grafana |
+| Scale pods on a custom metric | KEDA |
+| Generate traffic and watch scaling live | k6 |
+| Scale GPU (AI) workloads and their nodes | KEDA + GPU node pool |
 
 ---
 
-## Architecture
+## Contents
+
+1. [How it works](#how-it-works)
+2. [Repo layout](#repo-layout)
+3. [Step-by-step setup](#step-by-step-setup)
+4. [Watch it scale](#watch-it-scale)
+5. [GPU autoscaling (optional)](#gpu-autoscaling-optional)
+6. [Why KEDA?](#why-keda)
+7. [Cost benefit](#cost-benefit)
+8. [Troubleshooting](#troubleshooting)
+9. [Next steps](#next-steps)
+10. [Links](#links)
+
+---
+
+## How it works
 
 ```
-                    Internet
-                        │
-                  Traefik Ingress
-                        │
-                 Node.js Application
-                        │
-                  /metrics endpoint
-                        │
-                  ServiceMonitor
-                        │
-                  Prometheus
-                        │
-      ┌─────────────────┴──────────────────┐
-      │                                     │
-   Grafana                            Prometheus Adapter
-      │                                     │
-      ▼                                     ▼
-  Dashboards                              KEDA
-                                            │
-                                       ScaledObject
-                                            │
-                                       HPA (managed by KEDA)
-                                            │
-                                        Deployment
-                                            │
-                                           Pods
+ Users / k6 ──► Traefik (ingress) ──► Node.js app pods
+                                          │  /metrics
+                                          ▼
+                                     Prometheus  ──►  Grafana (graphs)
+                                          ▲
+                                          │ asks every 30s:
+                                          │ "how many requests per second?"
+                                        KEDA
+                                          │ creates and updates
+                                          ▼
+                                    HPA ──► adds / removes pods
 ```
 
-**Flow summary:**
+1. The app counts every request and shows the numbers at `/metrics`.
+2. Prometheus reads `/metrics` every 15 seconds.
+3. KEDA asks Prometheus: *"how many requests per second right now?"*
+4. KEDA's rule: **1 pod for every 20 requests/second**, minimum 2, maximum 10.
+   - 50 req/s → 3 pods · 150 req/s → 8 pods · 500 req/s → 10 pods (max)
+5. KEDA tells Kubernetes (via a standard HPA) how many pods to run.
 
-- Traffic hits the app through the Traefik ingress controller.
-- The Node.js app exposes an HTTP `/metrics` endpoint (request count, latency, etc.) in Prometheus format.
-- A `ServiceMonitor` tells Prometheus to scrape that endpoint.
-- Prometheus stores the time-series data; Grafana visualizes it via dashboards.
-- KEDA queries Prometheus on an interval, evaluates the `ScaledObject` trigger (e.g. requests/sec), and creates/updates a native Kubernetes `HPA` object under the hood.
-- The HPA scales the `Deployment` replica count up or down, and pods are added/removed accordingly.
+**Scaling speed:** pods are added quickly (can double every 15s) and removed
+slowly (after 5 quiet minutes, at most half per minute), so a short dip in
+traffic doesn't kill pods you will need again.
 
 ---
 
-## Prerequisites
+## Repo layout
 
-- A local Kubernetes cluster: **Ubuntu** (bare-metal/VM) or **WSL2**, running Docker + k3s.
-- `kubectl` and `helm` installed and configured against the cluster.
-- Internet access to pull Helm charts and container images.
+```
+app/                          Node.js app (Express + prom-client), Dockerfile
+kubernetes/
+├── app/                      Namespace, Deployment, Service, Ingress, ServiceMonitor
+├── keda/scaledobject.yaml    The scaling rule (requests/sec → pods)
+├── monitoring/               Prometheus Helm values + ingresses for Prometheus/Grafana
+└── gpu/                      Optional GPU autoscaling lab (see its own README)
+loadtest/
+├── k6.js                     Load test for the HTTP app
+└── k6-llm.js                 Load test for the GPU / LLM lab
+```
 
-### 1. Cluster Setup
+---
 
-Download and run the cluster bootstrap script:
+## Step-by-step setup
+
+**You need:** Ubuntu (VM or bare metal) or WSL2, about 4 CPU and 8 GB RAM,
+and internet access.
+
+### Step 1 — Create the cluster
 
 ```bash
 wget https://raw.githubusercontent.com/sajedul5/devops/main/setup-docker-k3s.sh
@@ -89,467 +91,265 @@ chmod +x setup-docker-k3s.sh
 ./setup-docker-k3s.sh
 ```
 
-> Script repo reference: https://github.com/sajedul5/devops/blob/main/setup-docker-k3s.sh
+✅ Check: `kubectl get nodes` shows one node with status `Ready`.
 
-Verify the cluster is healthy:
-
-```bash
-docker ps
-kubectl get ns
-kubectl get node
-```
-
----
-
-## 2. Clone the Application Repo
+### Step 2 — Get the code
 
 ```bash
 git clone https://github.com/sajedul5/kubernetes-http-request-hpa.git
 cd kubernetes-http-request-hpa
 ```
 
----
-
-## 3. Monitoring Stack Setup
-
-### Add Helm Repositories
+### Step 3 — Install Prometheus and Grafana
 
 ```bash
-# install Helm first if it's not already available
 helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-helm repo add grafana https://grafana.github.io/helm-charts
 helm repo update
-```
 
-### Install kube-prometheus-stack
-
-```bash
 kubectl create namespace monitoring
 
 helm install monitoring prometheus-community/kube-prometheus-stack \
   --namespace monitoring \
-  --values monitoring/prometheus-values.yaml
+  --values kubernetes/monitoring/prometheus-values.yaml
 ```
 
-This single chart installs Prometheus, Alertmanager, Grafana, node-exporter,
-kube-state-metrics, and the CRDs (`ServiceMonitor`, `PodMonitor`, etc.) needed
-for KEDA and the app to be scraped automatically.
-
-### Expose via Ingress
+Open them in the browser via ingress. First change the hostnames in
+`kubernetes/monitoring/*-ingress.yaml` to `grafana.<YOUR-IP>.nip.io` and
+`prometheus.<YOUR-IP>.nip.io` ([nip.io](https://nip.io) turns any IP into a
+free hostname).
 
 ```bash
-kubectl apply -f monitoring/prometheus-ingress.yaml
-kubectl apply -f monitoring/grafana-ingress.yaml
-
-kubectl get ingress -n monitoring
+kubectl apply -f kubernetes/monitoring/prometheus-ingress.yaml
+kubectl apply -f kubernetes/monitoring/grafana-ingress.yaml
 ```
 
----
+✅ Check: `kubectl get pods -n monitoring` — all pods `Running`.
+Grafana login: `admin` / the password in `prometheus-values.yaml`
+(**change it** before using this anywhere public).
 
-## 4. Deploy the Application
+### Step 4 — Deploy the app
+
+Change the host in `kubernetes/app/ingress.yaml` to `app.<YOUR-IP>.nip.io`, then:
 
 ```bash
 kubectl apply -f kubernetes/app/
-
-kubectl get all -n http-request-hpa
-kubectl get pods -n http-request-hpa
 ```
 
----
+✅ Check: `kubectl get pods -n http-request-hpa` shows 2 pods `Running`, and
+`curl http://app.<YOUR-IP>.nip.io` returns `Hello from Kubernetes`.
 
-## 5. Install KEDA
+### Step 5 — Install KEDA and the scaling rule
 
 ```bash
 helm repo add kedacore https://kedacore.github.io/charts
 helm repo update
-
 helm install keda kedacore/keda --namespace keda --create-namespace
+
+kubectl apply -f kubernetes/keda/scaledobject.yaml
 ```
 
-Apply the `ScaledObject` that defines the scaling trigger (Prometheus query
-on HTTP requests per second):
+✅ Check: `kubectl get hpa -n http-request-hpa` shows an HPA created by KEDA,
+with a number (not `<unknown>`) in the `TARGETS` column.
 
-```bash
-kubectl apply -f keda/scaledobject.yaml
-```
+### Step 6 — Send traffic
 
-Verify:
-
-```bash
-kubectl get pods -n keda
-kubectl get hpa -n http-request-hpa
-kubectl get pods -n http-request-hpa
-```
-
-Once the `ScaledObject` is applied, KEDA automatically creates and manages a
-standard Kubernetes `HPA` resource for you — you don't write the HPA by hand.
-
----
-
-## 6. Load Testing
-
-### Install k6
+Install k6:
 
 ```bash
 sudo apt update && sudo apt install -y curl gnupg ca-certificates
 curl -fsSL https://dl.k6.io/key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/k6-archive-keyring.gpg
-echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list >/dev/null
+echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" \
+  | sudo tee /etc/apt/sources.list.d/k6.list >/dev/null
 sudo apt update && sudo apt install -y k6
-
-k6 version
 ```
 
-### Run the Load Test
+Change the URL in `loadtest/k6.js` to your app's address, then:
 
 ```bash
 k6 run loadtest/k6.js
 ```
 
+The test runs for 8 minutes: warm up → medium → high → back to zero users.
+
 ---
 
-## 7. Observe Autoscaling in Real Time
+## Watch it scale
 
-Open **two terminals** alongside the running load test:
+Open two more terminals while k6 runs:
 
 ```bash
-# Terminal 1 — watch pods scale live
-kubectl get pods -n http-request-hpa -w
-
-# Terminal 2 — periodic snapshot
-kubectl get pods -n http-request-hpa
+kubectl get pods -n http-request-hpa -w     # pods appear and disappear live
+kubectl get hpa  -n http-request-hpa -w     # current req/s vs target, replica count
 ```
 
-Also open the **Grafana** dashboard (via the ingress URL configured earlier)
-to watch request-rate, replica count, and resource usage graphs update in
-real time, and check **Prometheus** directly to confirm the raw metric KEDA
-is querying.
+| Time | What you should see |
+|---|---|
+| 0–2 min (warm up) | Requests rise, pods go from 2 to more |
+| 2–6 min (high load) | Pods reach the maximum of 10 |
+| 6–8 min (load drops) | Pods stay for ~5 min (by design) |
+| After the test | Pods slowly go back to 2 |
+
+In **Grafana**, graph the same number KEDA uses:
+
+```promql
+sum(rate(http_requests_total{job="nodejs-service"}[1m]))
+```
 
 ---
 
-## 8. GPU Inference Autoscaling (Optional)
+## GPU autoscaling (optional)
 
-The same pattern — scale on the real demand signal from Prometheus — applied
-to GPU inference (LLM / ASR / TTS model serving). Here every replica costs a
-whole GPU, so the cost benefit is much larger than for the CPU app above.
-
-Full guide and manifests: [kubernetes/gpu/README.md](kubernetes/gpu/README.md)
-
-### Architecture
+The same idea for AI model servers (LLM, speech-to-text, text-to-speech).
+Each pod needs one whole GPU, so it matters much more: GPUs cost
+~$1–4 per hour each, while a small CPU pod costs almost nothing.
 
 ```
-k6 Job ─► Service vllm:8000 ─► vLLM pods (1 GPU each)
-                                   │  vllm:num_requests_running / vllm:num_requests_waiting
-                              ServiceMonitor ─► Prometheus ◄── KEDA (every 15s)
-                                                                 │
-                     (running + waiting) / 12 per replica  (+ cron pre-warm)
-                                                                 │
-                                         HPA ─► more vLLM pods ─► Pending (no free GPU)
-                                                                 │
-                         Cluster Autoscaler adds a GPU node from the pool (min 0)
+More requests ─► KEDA adds a model pod ─► no free GPU, pod waits (Pending)
+                                              │
+                         Cluster Autoscaler adds a GPU machine (node)
+Fewer requests ─► KEDA removes pods ─► empty GPU machine is removed ─► you stop paying
 ```
 
-Two levels of autoscaling work together:
+**Two ways to try it:**
 
-1. **Pod level** — KEDA adds/removes inference pods based on concurrent requests.
-2. **Node level** — when a new pod can't find a free GPU it goes `Pending`, and
-   the Cluster Autoscaler (or Karpenter on EKS) adds a GPU node. When pods scale
-   down, empty GPU nodes are removed. **This is where the money is saved.**
-
-### Two ways to run it
-
-| | Local (`kubernetes/gpu/local/`) | GKE (`kubernetes/gpu/gke/`) |
+| | Local — free | Cloud (GKE) — real GPUs |
 |---|---|---|
-| Cluster | The k3s cluster from section 1 | GKE + spot NVIDIA L4 node pool |
-| GPU | Fake: node advertises `nvidia.com/gpu` | Real L4 |
-| Server | Mock vLLM (same metric names) | Real vLLM + Qwen2.5-0.5B |
-| Cost | Free | A few dollars per lab session |
-| You learn | KEDA queue logic, GPU scheduling, GPU exhaustion | Node autoscaling, real cold start, real $ numbers |
+| GPU | Fake (Kubernetes is told the node has 4 GPUs) | Real NVIDIA L4 |
+| Model server | Small mock server that behaves like vLLM | Real vLLM + a small model |
+| Cost | $0 | A few dollars per session |
+| Good for learning | The scaling logic, GPU scheduling | Real start-up times and real cost |
 
-**Local (no GPU needed):**
+Quick start (local):
 
 ```bash
-# make the node look like a GPU node (4 fake GPUs)
-./kubernetes/gpu/local/fake-gpu-node.sh
-
+./kubernetes/gpu/local/fake-gpu-node.sh                 # make the node look like it has 4 GPUs
 kubectl apply -f kubernetes/gpu/namespace.yaml
 kubectl apply -f kubernetes/gpu/local/mock-vllm.yaml
 kubectl apply -f kubernetes/gpu/service.yaml -f kubernetes/gpu/servicemonitor.yaml
 kubectl apply -f kubernetes/gpu/scaledobject.yaml
 
-# load test runs inside the cluster so traffic spreads over all pods
 kubectl create configmap k6-llm -n llm --from-file=loadtest/k6-llm.js
-kubectl apply -f kubernetes/gpu/loadtest-job.yaml
-
+kubectl apply -f kubernetes/gpu/loadtest-job.yaml       # load test runs inside the cluster
 kubectl get pods -n llm -w
 ```
 
-Expected: replicas grow with load (~40 users → 4 pods), and **pods 5–6 stay
-`Pending` with `Insufficient nvidia.com/gpu`** — the GPU-exhaustion event that,
-on a cloud cluster, triggers a new GPU node.
+✅ Expected: pods grow with the load, and **pods 5 and 6 stay `Pending`**
+because there are only 4 GPUs. On a cloud cluster, this is exactly the moment
+a new GPU machine is added.
 
-**GKE (real GPUs):**
+Full guide, GKE steps and cleanup: **[kubernetes/gpu/README.md](kubernetes/gpu/README.md)**
 
-```bash
-./kubernetes/gpu/gke/create-cluster.sh        # check GPU quota first
-# install kube-prometheus-stack + KEDA (sections 3 and 5)
-kubectl apply -f kubernetes/gpu/namespace.yaml
-kubectl apply -f kubernetes/gpu/gke/vllm.yaml
-kubectl apply -f kubernetes/gpu/service.yaml -f kubernetes/gpu/servicemonitor.yaml
-kubectl apply -f kubernetes/gpu/scaledobject.yaml
-kubectl create configmap k6-llm -n llm --from-file=loadtest/k6-llm.js
-kubectl apply -f kubernetes/gpu/loadtest-job.yaml
+### Three things to know about GPU scaling
 
-./kubernetes/gpu/gke/delete-cluster.sh        # ALWAYS clean up after the lab
-```
+1. **Don't scale on "GPU utilization".** It shows ~100% even when the GPU is
+   barely working. Scale on **requests in progress + requests waiting**
+   instead (that's what this repo does).
+2. **Starting a GPU pod is slow: about 5–15 minutes** (new machine + driver +
+   large image + loading the model). So keep at least 1 pod always running in
+   production and pre-start pods before busy hours (this repo uses a KEDA
+   cron trigger for 9:00–21:00 on weekdays).
+3. **Spot GPUs are ~60–70% cheaper** but the cloud can take them back with
+   30 seconds' notice. Run the always-on pod on normal GPUs and the extra
+   pods on spot.
 
-### Choosing the GPU scaling metric
+---
 
-| Metric | Use for scaling? |
-|---|---|
-| `DCGM_FI_DEV_GPU_UTIL` (GPU utilization) | ❌ Shows ~100% whenever any kernel runs, even at low throughput |
-| `DCGM_FI_DEV_FB_USED` (GPU memory) | ❌ Constant once the model is loaded |
-| `vllm:num_requests_waiting` only | ⚠️ Reads 0 once the queue drains → scales down busy pods → oscillation |
-| `vllm:num_requests_running + vllm:num_requests_waiting` | ✅ Total demand — used in this repo |
-| Queue depth (Kafka / Redis / RabbitMQ) | ✅ Best for async / batch jobs |
+## Why KEDA?
 
-### GPU cold start
+Plain Kubernetes HPA only scales on CPU and memory out of the box. Scaling on
+anything else (like requests/second) needs a lot of extra setup. KEDA makes
+it a single small YAML file.
 
-| Step | Typical time |
-|---|---|
-| KEDA detects demand → pod Pending | 30–60s |
-| New GPU node provisioned | 1–3 min |
-| NVIDIA driver / device plugin ready | 1–2 min |
-| Pull inference image (10–20 GB) | 2–6 min |
-| Load model weights into GPU | 0.5–5 min |
-| **Total, zero to serving** | **~5–15 min** |
+| | Plain HPA | KEDA |
+|---|---|---|
+| Scale on CPU / memory | ✅ | ✅ |
+| Scale on requests/sec, queue length, etc. | ⚠️ Complex extra setup | ✅ One YAML file |
+| Built-in sources (Prometheus, Kafka, RabbitMQ, SQS, cron …) | ❌ | ✅ 60+ |
+| Scale down to 0 pods | ❌ (minimum 1) | ✅ |
+| Combine several rules | ❌ | ✅ |
 
-Because of this, the ScaledObject keeps `minReplicaCount: 1`, pre-warms with a
-cron trigger during office hours, and scales down slowly. The optional
-`gke/gpu-placeholder.yaml` keeps a spare GPU node warm with a low-priority pod
-that is evicted the moment a real pod needs the GPU.
+KEDA still creates a normal HPA behind the scenes, so all standard
+Kubernetes tools keep working. It is a CNCF graduated project and runs on any
+Kubernetes (k3s, EKS, GKE, AKS).
 
-### GPU cost benefit (example)
+> **About scale-to-zero:** this demo keeps at least 2 pods. Setting
+> `minReplicaCount: 0` here would **not** work well: the metric comes from the
+> app's own pods, so with 0 pods there is nothing to measure and nothing
+> wakes the app up. For real scale-to-zero, measure traffic at the ingress
+> (Traefik metrics) or use the
+> [KEDA HTTP Add-on](https://github.com/kedacore/http-add-on).
 
-Approximate on-demand NVIDIA L4 price ≈ $0.85/hr, spot ≈ 30–40% of that —
-check current prices for your region. Daily load: 8 GPUs for 6 h, 4 GPUs for
-8 h, 1 GPU for 10 h.
+---
 
-| Strategy | GPU-hours/day | ≈ $/month | Saving |
+## Cost benefit
+
+**Where the money is saved:** fewer pods → fewer machines (nodes) → smaller
+cloud bill. Pods alone cost nothing; the saving comes when the cluster
+autoscaler (or Karpenter) can **remove machines**. On a single local machine
+there is no saving — locally this project is for learning.
+
+| Situation | Without autoscaling | With autoscaling |
+|---|---|---|
+| Normal day/night traffic | Sized for peak, mostly idle (often <30% used) | Pods follow traffic |
+| Sudden traffic spike | Slow responses or errors | More pods within ~1–2 min |
+| Dev / test environments | Running 24×7 | Can scale down outside working hours |
+
+**GPU example** (one L4 GPU ≈ $0.85/hour on-demand, spot ≈ 30–40% of that;
+check current prices). Daily load: 8 GPUs for 6 h, 4 GPUs for 8 h, 1 GPU for 10 h.
+
+| Setup | GPU-hours per day | ≈ Cost per month | Saving |
 |---|---|---|---|
-| Static, sized for peak (8 × 24 h) | 192 | $4,900 | — |
-| KEDA + node autoscaling (+10% buffer) | ~99 | $2,520 | ~48% |
-| Same, burst above 2 GPUs on spot | ~99 | $1,550 | ~68% |
-| Dev/staging GPU: office hours only vs 24×7 | 220 vs 720 per month | $190 vs $610 | ~70% |
+| Always 8 GPUs (sized for peak) | 192 | $4,900 | — |
+| Autoscaling (+10% buffer) | ~99 | $2,520 | **~48%** |
+| Autoscaling, extra GPUs on spot | ~99 | $1,550 | **~68%** |
+| Dev GPU: working hours only vs 24×7 | 220 vs 720 per month | $190 vs $610 | **~70%** |
 
-Autoscaling GPUs pays off when peak load is more than ~1.5× the average, or
-when an environment is idle more than ~30% of the time. For production, keep
-the warm floor on on-demand GPUs and burst on spot.
+**Rule of thumb:** autoscaling is worth it when peak traffic is more than
+~1.5× the average, or when an environment sits idle more than ~30% of the time.
 
----
-
-## Why KEDA? (Deep Dive)
-
-### The limitation of vanilla HPA
-
-The stock Kubernetes **Horizontal Pod Autoscaler (HPA)** natively scales on
-CPU and memory only (via `metrics-server`). Custom metrics require the
-**Prometheus Adapter** and a lot of manual `APIService` / custom metrics API
-wiring — brittle, hard to maintain, and limited to metrics exposed through
-that adapter.
-
-### What KEDA adds
-
-- **Event-driven scaling**: KEDA can scale based on 60+ external sources —
-  Prometheus queries, message queue depth (RabbitMQ, Kafka, SQS), cron
-  schedules, HTTP request rate, database queue length, and more — not just
-  CPU/memory.
-- **Scale-to-zero**: Unlike vanilla HPA (minimum 1 replica), KEDA can scale a
-  deployment down to **zero pods** when there's no traffic/events, and scale
-  back up on the first event. This is the single biggest cost lever in this
-  architecture.
-- **Simplicity**: You describe *what* to scale on (`ScaledObject` CRD) and
-  KEDA manages the underlying HPA object for you — no manual custom-metrics
-  API plumbing.
-- **Decoupled scalers**: Each workload can scale on a different signal
-  (queue depth for a worker, HTTP RPS for an API, cron for a batch job) using
-  the same operator.
-- **Native HPA compatibility**: Because KEDA still produces a standard HPA
-  under the hood, it plays well with existing tooling, dashboards, and
-  cluster-autoscaler integrations.
-
-### KEDA vs Vanilla HPA — Summary
-
-| Capability                     | Vanilla HPA              | KEDA                                   |
-|---------------------------------|---------------------------|------------------------------------------|
-| CPU/Memory scaling               | ✅                         | ✅ (via HPA it creates)                  |
-| Custom metrics (e.g. RPS)        | ⚠️ Manual adapter setup   | ✅ Built-in scalers                      |
-| External event sources (queues)  | ❌                         | ✅ 60+ scalers                           |
-| Scale-to-zero                    | ❌ (min 1 replica)         | ✅                                       |
-| Setup complexity                 | Low (basic), High (custom)| Low (declarative `ScaledObject`)         |
-| Multiple trigger types per app   | ❌                         | ✅ (combine triggers)                    |
+**The trade-offs:** Prometheus + Grafana need ~1–2 CPU and 2–4 GB RAM; new
+pods take time to start (seconds for this app, minutes for GPUs); and there
+are more components to maintain.
 
 ---
-
-## Cost Benefit of This Architecture
-
-1. **Scale-to-zero for idle workloads** — Dev/staging services, batch
-   consumers, or low-traffic APIs run 0 pods when idle instead of a
-   permanently reserved baseline. On cloud infra (EKS/GKE/AKS), fewer
-   running pods directly means fewer nodes needed, which means lower
-   compute bill.
-2. **Right-sized scale-out** — Because scaling reacts to the *actual*
-   business signal (HTTP RPS) rather than a proxy metric (CPU), you avoid
-   both over-provisioning (paying for idle headroom) and under-provisioning
-   (latency/errors during traffic spikes).
-3. **Cluster Autoscaler synergy** — When KEDA scales pods down to zero or a
-   minimum, unused nodes become eligible for removal by the Kubernetes
-   Cluster Autoscaler / Karpenter, compounding savings at the node level,
-   not just the pod level.
-4. **Fewer wasted reserved instances** — Predictable scale-to-zero behavior
-   lets you rely more on spot/preemptible capacity for bursty workloads
-   instead of over-provisioning reserved capacity for peak load year-round.
-5. **Observability-driven decisions** — Because Prometheus/Grafana are part
-   of this stack from day one, you get real utilization data to right-size
-   requests/limits, instead of guessing.
-
----
-
-## Resource Utilization
-
-- **Before (static replicas or CPU-based HPA)**: Pods are often sized for
-  peak load and stay running at that count even during low-traffic hours,
-  leading to poor average CPU/memory utilization (commonly under 20–30%
-  outside peak).
-- **After (KEDA + Prometheus RPS scaling)**: Replica count tracks the actual
-  request curve, so utilization stays closer to the target band you define
-  in the `ScaledObject`, and idle periods free up cluster capacity for other
-  workloads instead of sitting reserved and unused.
-- **Metrics-driven tuning**: Grafana dashboards built on the same Prometheus
-  data used for scaling let you continuously tune `minReplicaCount`,
-  `maxReplicaCount`, cooldown periods, and target thresholds based on real
-  traffic patterns rather than guesswork.
-
----
-
-## Why This Matters for Production
-
-- **Traffic is rarely flat.** Real-world HTTP services see diurnal patterns,
-  marketing-driven spikes, and regional traffic waves. Request-rate-based
-  autoscaling responds to the thing that actually causes user-facing
-  latency, not an indirect proxy like CPU.
-- **SLA protection**: Faster, metric-accurate scale-out reduces the chance
-  of request queuing/timeouts during sudden spikes (flash sales, viral
-  posts, incident-driven traffic).
-- **Operational consistency**: A single `ScaledObject` pattern can be reused
-  across many services/teams, standardizing how autoscaling is configured
-  cluster-wide instead of each team hand-rolling custom-metrics adapters.
-- **Full-stack observability is a production requirement, not a nice-to-have.**
-  Bundling Prometheus + Grafana with the scaler means you can see *why* a
-  scaling event happened, correlate it with error rates/latency, and debug
-  incidents — not just watch replica counts change blindly.
-- **Battle-tested in the ecosystem**: KEDA is a CNCF graduated project and is
-  commonly used in production alongside standard HPA/VPA/Cluster Autoscaler,
-  so this pattern maps directly onto real managed-Kubernetes environments
-  (EKS, AKS, GKE), not just local k3s.
-
----
-
-## Study Notes / Learning Path
-
-This repo is structured so it can be run either as:
-
-- **Local single-VM / WSL R&D environment** — a full loop (cluster → app →
-  monitoring → autoscaler → load test) on one machine, useful for learning
-  the mechanics of event-driven autoscaling without cloud cost.
-- **A DevOps self-study reference** — each numbered section above maps to a
-  concept worth understanding in isolation:
-  1. Cluster bootstrapping (Docker + k3s)
-  2. Helm chart-based installs
-  3. Prometheus Operator model (`ServiceMonitor`/`PodMonitor` CRDs)
-  4. Ingress routing (Traefik)
-  5. Custom-metrics-based autoscaling (KEDA `ScaledObject` → HPA)
-  6. Load testing methodology (k6)
-  7. Reading autoscaling behavior live via `kubectl -w` + Grafana
-
-Suggested next steps for deeper study:
-- Swap the Prometheus scaler for a queue-based scaler (RabbitMQ/Kafka) to
-  see KEDA's event-driven model outside the HTTP use case.
-- Add `minReplicaCount: 0` to observe true scale-to-zero and cold-start
-  latency trade-offs.
-- Pair this with Cluster Autoscaler in a cloud-managed cluster to observe
-  node-level cost savings, not just pod-level.
-- Apply the same pattern to GPU inference with a GPU node pool — see
-  [kubernetes/gpu/README.md](kubernetes/gpu/README.md) (local fake-GPU mode
-  or GKE with real L4 GPUs).
-
----
-
-## Resources & References
-
-### KEDA (event-driven autoscaling)
-- Official docs: https://keda.sh/docs/latest/
-- Concepts (ScaledObject, ScaledJob, scalers): https://keda.sh/docs/latest/concepts/
-- Full scaler list (Prometheus, Kafka, RabbitMQ, SQS, cron, etc.): https://keda.sh/docs/latest/scalers/
-- GitHub repo: https://github.com/kedacore/keda
-- CNCF project page (graduated status): https://www.cncf.io/projects/keda/
-
-### Kubernetes Autoscaling (core concepts)
-- Horizontal Pod Autoscaler: https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/
-- HPA walkthrough: https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale-walkthrough/
-- Cluster Autoscaler: https://github.com/kubernetes/autoscaler/tree/master/cluster-autoscaler
-- Karpenter (alternative node autoscaler, cloud-native): https://karpenter.sh/
-
-### Prometheus & Monitoring
-- Prometheus docs: https://prometheus.io/docs/introduction/overview/
-- PromQL basics: https://prometheus.io/docs/prometheus/latest/querying/basics/
-- kube-prometheus-stack Helm chart: https://github.com/prometheus-community/helm-charts/tree/main/charts/kube-prometheus-stack
-- Prometheus Operator (ServiceMonitor/PodMonitor CRDs): https://prometheus-operator.dev/
-- Grafana docs: https://grafana.com/docs/grafana/latest/
-- Grafana + Prometheus data source setup: https://grafana.com/docs/grafana/latest/datasources/prometheus/
-
-### Cluster Tooling
-- k3s docs: https://docs.k3s.io/
-- Helm docs: https://helm.sh/docs/
-- Traefik Kubernetes Ingress: https://doc.traefik.io/traefik/providers/kubernetes-ingress/
-- kubectl cheat sheet: https://kubernetes.io/docs/reference/kubectl/cheatsheet/
-
-### Load Testing
-- k6 docs: https://grafana.com/docs/k6/latest/
-- k6 + Kubernetes/Prometheus integration guide: https://grafana.com/docs/k6/latest/results-output/real-time/prometheus-remote-write/
-
-### GPU Workloads
-- Kubernetes GPU scheduling: https://kubernetes.io/docs/tasks/manage-gpus/scheduling-gpus/
-- Advertise extended resources (how the fake GPU works): https://kubernetes.io/docs/tasks/administer-cluster/extended-resource-node/
-- GKE GPUs: https://cloud.google.com/kubernetes-engine/docs/how-to/gpus
-- NVIDIA GPU Operator: https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/
-- NVIDIA DCGM exporter: https://github.com/NVIDIA/dcgm-exporter
-- vLLM production metrics: https://docs.vllm.ai/en/latest/serving/metrics.html
-- KEDA cron scaler: https://keda.sh/docs/latest/scalers/cron/
-
-### Broader Reading (cost/production practices)
-- Kubernetes cost optimization guide (FinOps Foundation): https://www.finops.org/framework/
-- CNCF cloud native landscape (for exploring adjacent tools): https://landscape.cncf.io/
-- "Scaling Kubernetes to zero" — KEDA blog/case studies: https://keda.sh/blog/
 
 ## Troubleshooting
 
-- **`kubectl get hpa` shows no metrics / `<unknown>` targets**: Confirm the
-  `ServiceMonitor` for the app exists and Prometheus is actually scraping
-  `/metrics` (check the Prometheus **Targets** page).
-- **KEDA pods not starting**: Check `kubectl logs -n keda deploy/keda-operator`
-  and confirm the `keda` namespace has network access to Prometheus.
-- **Ingress not reachable**: Confirm Traefik is running (`kubectl get pods -n kube-system`
-  on k3s) and that the ingress hostnames resolve locally (`/etc/hosts` entry
-  or `nip.io`-style DNS for local testing).
-- **Load test shows no scaling**: Double check the `ScaledObject`'s
-  `triggers.metadata.query` against what's actually visible in the
-  Prometheus UI for the same PromQL expression.
-- **GPU pods stuck `Pending` (local)**: Run `kubectl describe node` and check
-  that `Allocatable` shows `nvidia.com/gpu` and the node has the
-  `gpu-node=true` label; re-run `kubernetes/gpu/local/fake-gpu-node.sh` if not.
-  Pending pods beyond the fake GPU count are expected.
-- **GPU pods stuck `Pending` (GKE)**: Check `kubectl get events -n llm` for
-  `NotTriggerScaleUp` — usually GPU quota is 0 in the region or spot L4
-  capacity is unavailable in the zone; request quota or try another zone.
-- **vLLM pod restarts during startup**: The model download/load is slower than
-  the `startupProbe` allows; increase `failureThreshold` in `gke/vllm.yaml`.
+| Problem | What to check |
+|---|---|
+| HPA `TARGETS` shows `<unknown>` | Prometheus UI → **Status → Targets**: is `nodejs-service` listed and `UP`? |
+| KEDA pods not starting | `kubectl logs -n keda deploy/keda-operator` |
+| App / Grafana URL not opening | Is Traefik running? (`kubectl get pods -n kube-system`). Is the hostname `<name>.<YOUR-IP>.nip.io`? |
+| Load test runs but no scaling | Paste the query from `scaledobject.yaml` into the Prometheus UI — does it return a number? |
+| Load test shows errors at high load | Expected: the test can send more traffic than 10 pods handle at 20 req/s each. Raise `maxReplicaCount` or `threshold`. |
+| GPU pods `Pending` (local) | `kubectl describe node` should show `nvidia.com/gpu` under Allocatable. If not, re-run `fake-gpu-node.sh`. Pods beyond 4 GPUs stay Pending by design. |
+| GPU pods `Pending` (GKE) | `kubectl get events -n llm` — `NotTriggerScaleUp` usually means GPU quota is 0 or no spot L4 is available in that zone. |
+| vLLM pod keeps restarting at start | Model loading is slower than the startup probe allows. Increase `failureThreshold` in `kubernetes/gpu/gke/vllm.yaml`. |
+
+---
+
+## Next steps
+
+- **Find the real capacity of one pod:** run k6 until responses get slow, then
+  set `threshold` to ~70% of that. The `20` req/s here is low on purpose so the
+  demo scales quickly — a real Node.js pod can handle far more.
+- **Try a queue instead of HTTP:** swap the Prometheus trigger for RabbitMQ or
+  Kafka.
+- **Try true scale-to-zero:** use Traefik metrics or the KEDA HTTP Add-on and
+  measure how long the first request waits.
+- **Try it on a cloud cluster** with Cluster Autoscaler or Karpenter to see
+  machines being added and removed, not just pods.
+- **Try the GPU lab:** [kubernetes/gpu/README.md](kubernetes/gpu/README.md).
+
+---
+
+## Links
+
+| Topic | Links |
+|---|---|
+| KEDA | [Docs](https://keda.sh/docs/latest/) · [Concepts](https://keda.sh/docs/latest/concepts/) · [All scalers](https://keda.sh/docs/latest/scalers/) · [Cron scaler](https://keda.sh/docs/latest/scalers/cron/) · [HTTP Add-on](https://github.com/kedacore/http-add-on) |
+| Kubernetes autoscaling | [HPA](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/) · [HPA walkthrough](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale-walkthrough/) · [Cluster Autoscaler](https://github.com/kubernetes/autoscaler/tree/master/cluster-autoscaler) · [Karpenter](https://karpenter.sh/) |
+| Monitoring | [Prometheus](https://prometheus.io/docs/introduction/overview/) · [PromQL basics](https://prometheus.io/docs/prometheus/latest/querying/basics/) · [kube-prometheus-stack](https://github.com/prometheus-community/helm-charts/tree/main/charts/kube-prometheus-stack) · [Prometheus Operator](https://prometheus-operator.dev/) · [Grafana](https://grafana.com/docs/grafana/latest/) |
+| GPU | [Scheduling GPUs](https://kubernetes.io/docs/tasks/manage-gpus/scheduling-gpus/) · [Extended resources (fake GPU)](https://kubernetes.io/docs/tasks/administer-cluster/extended-resource-node/) · [GKE GPUs](https://cloud.google.com/kubernetes-engine/docs/how-to/gpus) · [NVIDIA GPU Operator](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/) · [DCGM exporter](https://github.com/NVIDIA/dcgm-exporter) · [vLLM metrics](https://docs.vllm.ai/en/latest/serving/metrics.html) |
+| Tools | [k3s](https://docs.k3s.io/) · [Helm](https://helm.sh/docs/) · [Traefik ingress](https://doc.traefik.io/traefik/providers/kubernetes-ingress/) · [kubectl cheat sheet](https://kubernetes.io/docs/reference/kubectl/cheatsheet/) · [k6](https://grafana.com/docs/k6/latest/) |
+| Cost | [FinOps framework](https://www.finops.org/framework/) · [KEDA blog](https://keda.sh/blog/) · [CNCF landscape](https://landscape.cncf.io/) |
