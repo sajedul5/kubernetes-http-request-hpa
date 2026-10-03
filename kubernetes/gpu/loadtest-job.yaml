@@ -1,0 +1,33 @@
+# Create the script ConfigMap first:
+#   kubectl create configmap k6-llm -n llm --from-file=loadtest/k6-llm.js
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: k6-llm
+  namespace: llm
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+
+  template:
+    spec:
+      restartPolicy: Never
+
+      containers:
+      - name: k6
+        image: grafana/k6:0.54.0
+        args: ["run", "/scripts/k6-llm.js"]
+
+        resources:
+          requests:
+            cpu: 200m
+            memory: 256Mi
+
+        volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+
+      volumes:
+      - name: scripts
+        configMap:
+          name: k6-llm

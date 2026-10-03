@@ -1,0 +1,92 @@
+# Real vLLM inference server on a GKE L4 spot node.
+# Qwen2.5-0.5B is small enough to load fast; swap in your own model for real numbers.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm
+  namespace: llm
+  labels:
+    app: vllm
+spec:
+  # no "replicas" field: KEDA owns the replica count
+
+  selector:
+    matchLabels:
+      app: vllm
+
+  template:
+    metadata:
+      labels:
+        app: vllm
+
+    spec:
+      nodeSelector:
+        cloud.google.com/gke-accelerator: nvidia-l4
+        cloud.google.com/gke-spot: "true"
+
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+
+      # Spot VMs get ~30s notice before preemption
+      terminationGracePeriodSeconds: 30
+
+      containers:
+      - name: vllm
+        # pin to a current release: https://hub.docker.com/r/vllm/vllm-openai/tags
+        image: vllm/vllm-openai:v0.6.4
+        args:
+        - --model=Qwen/Qwen2.5-0.5B-Instruct
+        - --served-model-name=qwen
+        - --max-num-seqs=16          # keep above the ScaledObject threshold (12)
+        - --max-model-len=4096
+        - --gpu-memory-utilization=0.90
+        - --port=8000
+
+        ports:
+        - containerPort: 8000
+
+        resources:
+          requests:
+            cpu: "4"
+            memory: 16Gi
+          limits:
+            memory: 24Gi
+            nvidia.com/gpu: 1
+
+        # Model download + load can take minutes: allow up to 10 min to start
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          failureThreshold: 60
+          periodSeconds: 10
+
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          periodSeconds: 5
+
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          periodSeconds: 15
+
+        volumeMounts:
+        - name: dshm
+          mountPath: /dev/shm
+        - name: hf-cache
+          mountPath: /root/.cache/huggingface
+
+      volumes:
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 2Gi
+      # emptyDir means every new pod re-downloads the model.
+      # Use a PVC / GCS FUSE bucket to measure the cold-start improvement.
+      - name: hf-cache
+        emptyDir: {}

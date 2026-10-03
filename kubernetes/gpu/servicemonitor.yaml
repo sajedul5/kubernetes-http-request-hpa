@@ -1,0 +1,21 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: vllm
+  namespace: llm
+  labels:
+    release: monitoring
+spec:
+  namespaceSelector:
+    matchNames:
+      - llm
+
+  selector:
+    matchLabels:
+      app: vllm
+
+  # vLLM (and the mock server) expose /metrics on the same port as the API
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s

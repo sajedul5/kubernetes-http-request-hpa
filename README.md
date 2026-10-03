@@ -20,13 +20,14 @@ autoscaling setups.
 7. [Install KEDA](#5-install-keda)
 8. [Load Testing](#6-load-testing)
 9. [Observe Autoscaling in Real Time](#7-observe-autoscaling-in-real-time)
-10. [Why KEDA? (Deep Dive)](#why-keda-deep-dive)
-11. [Cost Benefit of This Architecture](#cost-benefit-of-this-architecture)
-12. [Resource Utilization](#resource-utilization)
-13. [Why This Matters for Production](#why-this-matters-for-production)
-14. [Study Notes / Learning Path](#study-notes--learning-path)
-15. [Resources & References](#resources--references)
-16. [Troubleshooting](#troubleshooting)
+10. [GPU Inference Autoscaling (Optional)](#8-gpu-inference-autoscaling-optional)
+11. [Why KEDA? (Deep Dive)](#why-keda-deep-dive)
+12. [Cost Benefit of This Architecture](#cost-benefit-of-this-architecture)
+13. [Resource Utilization](#resource-utilization)
+14. [Why This Matters for Production](#why-this-matters-for-production)
+15. [Study Notes / Learning Path](#study-notes--learning-path)
+16. [Resources & References](#resources--references)
+17. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -225,6 +226,127 @@ is querying.
 
 ---
 
+## 8. GPU Inference Autoscaling (Optional)
+
+The same pattern — scale on the real demand signal from Prometheus — applied
+to GPU inference (LLM / ASR / TTS model serving). Here every replica costs a
+whole GPU, so the cost benefit is much larger than for the CPU app above.
+
+Full guide and manifests: [kubernetes/gpu/README.md](kubernetes/gpu/README.md)
+
+### Architecture
+
+```
+k6 Job ─► Service vllm:8000 ─► vLLM pods (1 GPU each)
+                                   │  vllm:num_requests_running / vllm:num_requests_waiting
+                              ServiceMonitor ─► Prometheus ◄── KEDA (every 15s)
+                                                                 │
+                     (running + waiting) / 12 per replica  (+ cron pre-warm)
+                                                                 │
+                                         HPA ─► more vLLM pods ─► Pending (no free GPU)
+                                                                 │
+                         Cluster Autoscaler adds a GPU node from the pool (min 0)
+```
+
+Two levels of autoscaling work together:
+
+1. **Pod level** — KEDA adds/removes inference pods based on concurrent requests.
+2. **Node level** — when a new pod can't find a free GPU it goes `Pending`, and
+   the Cluster Autoscaler (or Karpenter on EKS) adds a GPU node. When pods scale
+   down, empty GPU nodes are removed. **This is where the money is saved.**
+
+### Two ways to run it
+
+| | Local (`kubernetes/gpu/local/`) | GKE (`kubernetes/gpu/gke/`) |
+|---|---|---|
+| Cluster | The k3s cluster from section 1 | GKE + spot NVIDIA L4 node pool |
+| GPU | Fake: node advertises `nvidia.com/gpu` | Real L4 |
+| Server | Mock vLLM (same metric names) | Real vLLM + Qwen2.5-0.5B |
+| Cost | Free | A few dollars per lab session |
+| You learn | KEDA queue logic, GPU scheduling, GPU exhaustion | Node autoscaling, real cold start, real $ numbers |
+
+**Local (no GPU needed):**
+
+```bash
+# make the node look like a GPU node (4 fake GPUs)
+./kubernetes/gpu/local/fake-gpu-node.sh
+
+kubectl apply -f kubernetes/gpu/namespace.yaml
+kubectl apply -f kubernetes/gpu/local/mock-vllm.yaml
+kubectl apply -f kubernetes/gpu/service.yaml -f kubernetes/gpu/servicemonitor.yaml
+kubectl apply -f kubernetes/gpu/scaledobject.yaml
+
+# load test runs inside the cluster so traffic spreads over all pods
+kubectl create configmap k6-llm -n llm --from-file=loadtest/k6-llm.js
+kubectl apply -f kubernetes/gpu/loadtest-job.yaml
+
+kubectl get pods -n llm -w
+```
+
+Expected: replicas grow with load (~40 users → 4 pods), and **pods 5–6 stay
+`Pending` with `Insufficient nvidia.com/gpu`** — the GPU-exhaustion event that,
+on a cloud cluster, triggers a new GPU node.
+
+**GKE (real GPUs):**
+
+```bash
+./kubernetes/gpu/gke/create-cluster.sh        # check GPU quota first
+# install kube-prometheus-stack + KEDA (sections 3 and 5)
+kubectl apply -f kubernetes/gpu/namespace.yaml
+kubectl apply -f kubernetes/gpu/gke/vllm.yaml
+kubectl apply -f kubernetes/gpu/service.yaml -f kubernetes/gpu/servicemonitor.yaml
+kubectl apply -f kubernetes/gpu/scaledobject.yaml
+kubectl create configmap k6-llm -n llm --from-file=loadtest/k6-llm.js
+kubectl apply -f kubernetes/gpu/loadtest-job.yaml
+
+./kubernetes/gpu/gke/delete-cluster.sh        # ALWAYS clean up after the lab
+```
+
+### Choosing the GPU scaling metric
+
+| Metric | Use for scaling? |
+|---|---|
+| `DCGM_FI_DEV_GPU_UTIL` (GPU utilization) | ❌ Shows ~100% whenever any kernel runs, even at low throughput |
+| `DCGM_FI_DEV_FB_USED` (GPU memory) | ❌ Constant once the model is loaded |
+| `vllm:num_requests_waiting` only | ⚠️ Reads 0 once the queue drains → scales down busy pods → oscillation |
+| `vllm:num_requests_running + vllm:num_requests_waiting` | ✅ Total demand — used in this repo |
+| Queue depth (Kafka / Redis / RabbitMQ) | ✅ Best for async / batch jobs |
+
+### GPU cold start
+
+| Step | Typical time |
+|---|---|
+| KEDA detects demand → pod Pending | 30–60s |
+| New GPU node provisioned | 1–3 min |
+| NVIDIA driver / device plugin ready | 1–2 min |
+| Pull inference image (10–20 GB) | 2–6 min |
+| Load model weights into GPU | 0.5–5 min |
+| **Total, zero to serving** | **~5–15 min** |
+
+Because of this, the ScaledObject keeps `minReplicaCount: 1`, pre-warms with a
+cron trigger during office hours, and scales down slowly. The optional
+`gke/gpu-placeholder.yaml` keeps a spare GPU node warm with a low-priority pod
+that is evicted the moment a real pod needs the GPU.
+
+### GPU cost benefit (example)
+
+Approximate on-demand NVIDIA L4 price ≈ $0.85/hr, spot ≈ 30–40% of that —
+check current prices for your region. Daily load: 8 GPUs for 6 h, 4 GPUs for
+8 h, 1 GPU for 10 h.
+
+| Strategy | GPU-hours/day | ≈ $/month | Saving |
+|---|---|---|---|
+| Static, sized for peak (8 × 24 h) | 192 | $4,900 | — |
+| KEDA + node autoscaling (+10% buffer) | ~99 | $2,520 | ~48% |
+| Same, burst above 2 GPUs on spot | ~99 | $1,550 | ~68% |
+| Dev/staging GPU: office hours only vs 24×7 | 220 vs 720 per month | $190 vs $610 | ~70% |
+
+Autoscaling GPUs pays off when peak load is more than ~1.5× the average, or
+when an environment is idle more than ~30% of the time. For production, keep
+the warm floor on on-demand GPUs and burst on spot.
+
+---
+
 ## Why KEDA? (Deep Dive)
 
 ### The limitation of vanilla HPA
@@ -356,6 +478,9 @@ Suggested next steps for deeper study:
   latency trade-offs.
 - Pair this with Cluster Autoscaler in a cloud-managed cluster to observe
   node-level cost savings, not just pod-level.
+- Apply the same pattern to GPU inference with a GPU node pool — see
+  [kubernetes/gpu/README.md](kubernetes/gpu/README.md) (local fake-GPU mode
+  or GKE with real L4 GPUs).
 
 ---
 
@@ -392,6 +517,15 @@ Suggested next steps for deeper study:
 - k6 docs: https://grafana.com/docs/k6/latest/
 - k6 + Kubernetes/Prometheus integration guide: https://grafana.com/docs/k6/latest/results-output/real-time/prometheus-remote-write/
 
+### GPU Workloads
+- Kubernetes GPU scheduling: https://kubernetes.io/docs/tasks/manage-gpus/scheduling-gpus/
+- Advertise extended resources (how the fake GPU works): https://kubernetes.io/docs/tasks/administer-cluster/extended-resource-node/
+- GKE GPUs: https://cloud.google.com/kubernetes-engine/docs/how-to/gpus
+- NVIDIA GPU Operator: https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/
+- NVIDIA DCGM exporter: https://github.com/NVIDIA/dcgm-exporter
+- vLLM production metrics: https://docs.vllm.ai/en/latest/serving/metrics.html
+- KEDA cron scaler: https://keda.sh/docs/latest/scalers/cron/
+
 ### Broader Reading (cost/production practices)
 - Kubernetes cost optimization guide (FinOps Foundation): https://www.finops.org/framework/
 - CNCF cloud native landscape (for exploring adjacent tools): https://landscape.cncf.io/
@@ -410,3 +544,12 @@ Suggested next steps for deeper study:
 - **Load test shows no scaling**: Double check the `ScaledObject`'s
   `triggers.metadata.query` against what's actually visible in the
   Prometheus UI for the same PromQL expression.
+- **GPU pods stuck `Pending` (local)**: Run `kubectl describe node` and check
+  that `Allocatable` shows `nvidia.com/gpu` and the node has the
+  `gpu-node=true` label; re-run `kubernetes/gpu/local/fake-gpu-node.sh` if not.
+  Pending pods beyond the fake GPU count are expected.
+- **GPU pods stuck `Pending` (GKE)**: Check `kubectl get events -n llm` for
+  `NotTriggerScaleUp` — usually GPU quota is 0 in the region or spot L4
+  capacity is unavailable in the zone; request quota or try another zone.
+- **vLLM pod restarts during startup**: The model download/load is slower than
+  the `startupProbe` allows; increase `failureThreshold` in `gke/vllm.yaml`.

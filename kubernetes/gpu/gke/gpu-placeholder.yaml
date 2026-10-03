@@ -1,0 +1,52 @@
+# Optional: keep one spare GPU node warm with a low-priority "placeholder" pod.
+# When KEDA adds a vLLM pod, the scheduler evicts the placeholder and the vLLM pod
+# starts immediately on the already-running node (skips the 1-3 min node provisioning).
+# The evicted placeholder goes Pending, which makes the autoscaler add the next spare node.
+#
+# Trade-off: you pay for one idle GPU node all the time. Measure if the faster
+# scale-up is worth it for your SLO.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: gpu-placeholder
+value: -10
+preemptionPolicy: Never
+globalDefault: false
+description: Placeholder pods that reserve spare GPU capacity
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpu-placeholder
+  namespace: llm
+spec:
+  replicas: 1
+
+  selector:
+    matchLabels:
+      app: gpu-placeholder
+
+  template:
+    metadata:
+      labels:
+        app: gpu-placeholder
+
+    spec:
+      priorityClassName: gpu-placeholder
+      terminationGracePeriodSeconds: 0
+
+      nodeSelector:
+        cloud.google.com/gke-accelerator: nvidia-l4
+        cloud.google.com/gke-spot: "true"
+
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+
+      containers:
+      - name: pause
+        image: registry.k8s.io/pause:3.9
+        resources:
+          limits:
+            nvidia.com/gpu: 1

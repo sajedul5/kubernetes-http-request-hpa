@@ -1,0 +1,59 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: vllm-scaler
+  namespace: llm
+spec:
+  scaleTargetRef:
+    name: vllm
+
+  # Keep one warm replica: a GPU cold start (node + driver + image + model) takes minutes.
+  # Set to 0 only for dev/staging where a slow first request is acceptable.
+  minReplicaCount: 1
+  maxReplicaCount: 6
+
+  pollingInterval: 15
+  cooldownPeriod: 600
+
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - type: Pods
+              value: 2
+              periodSeconds: 60
+
+        # Scale down slowly: a removed GPU pod is expensive to bring back
+        scaleDown:
+          stabilizationWindowSeconds: 900
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 300
+
+  triggers:
+    # Total demand = requests being processed + requests queued.
+    # Queue length alone is not enough: once the queue drains it reads 0 and the
+    # HPA would scale down pods that are still fully busy.
+    # threshold = target concurrent requests per replica (keep it below --max-num-seqs).
+    - type: prometheus
+      metadata:
+        serverAddress: http://monitoring-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
+
+        metricName: vllm_concurrent_requests
+
+        query: |
+          sum(vllm:num_requests_running{namespace="llm"})
+          + sum(vllm:num_requests_waiting{namespace="llm"})
+
+        threshold: "12"
+
+    # Pre-warm before the daily peak instead of waiting for the queue to build up
+    - type: cron
+      metadata:
+        timezone: Asia/Dhaka
+        start: 0 9 * * 1-5
+        end: 0 21 * * 1-5
+        desiredReplicas: "2"

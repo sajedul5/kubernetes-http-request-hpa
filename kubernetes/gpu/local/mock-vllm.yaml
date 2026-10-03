@@ -1,0 +1,162 @@
+# Mock of a vLLM OpenAI-compatible server for local R&D without a GPU.
+# It behaves like a GPU-bound inference server:
+#   - at most MAX_NUM_SEQS requests are processed at once (like vLLM --max-num-seqs)
+#   - extra requests wait in a queue
+#   - exposes the same metric names as vLLM: vllm:num_requests_running / vllm:num_requests_waiting
+# Each pod requests 1 nvidia.com/gpu, so it only schedules on the fake GPU node.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mock-vllm
+  namespace: llm
+data:
+  server.py: |
+    import os, random, threading, time, json
+    from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+
+    MAX_NUM_SEQS = int(os.environ.get("MAX_NUM_SEQS", "16"))
+    LATENCY = float(os.environ.get("REQUEST_LATENCY_SECONDS", "2"))
+    MODEL = os.environ.get("MODEL_NAME", "mock-llm")
+
+    slots = threading.Semaphore(MAX_NUM_SEQS)
+    lock = threading.Lock()
+    stats = {"running": 0, "waiting": 0, "success": 0, "latency_sum": 0.0}
+
+    def add(key, value):
+        with lock:
+            stats[key] += value
+
+    def metrics():
+        labels = f'{{model_name="{MODEL}"}}'
+        with lock:
+            s = dict(stats)
+        return (
+            "# TYPE vllm:num_requests_running gauge\n"
+            f"vllm:num_requests_running{labels} {s['running']}\n"
+            "# TYPE vllm:num_requests_waiting gauge\n"
+            f"vllm:num_requests_waiting{labels} {s['waiting']}\n"
+            "# TYPE vllm:request_success_total counter\n"
+            f"vllm:request_success_total{labels} {s['success']}\n"
+            "# TYPE vllm:e2e_request_latency_seconds summary\n"
+            f"vllm:e2e_request_latency_seconds_sum{labels} {s['latency_sum']}\n"
+            f"vllm:e2e_request_latency_seconds_count{labels} {s['success']}\n"
+        )
+
+    class Handler(BaseHTTPRequestHandler):
+        def send(self, code, body, content_type="application/json"):
+            data = body.encode()
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            if self.path == "/health":
+                self.send(200, "OK", "text/plain")
+            elif self.path == "/metrics":
+                self.send(200, metrics(), "text/plain; version=0.0.4")
+            elif self.path == "/v1/models":
+                self.send(200, json.dumps({"data": [{"id": MODEL}]}))
+            else:
+                self.send(404, json.dumps({"error": "not found"}))
+
+        def do_POST(self):
+            if self.path not in ("/v1/chat/completions", "/v1/completions"):
+                self.send(404, json.dumps({"error": "not found"}))
+                return
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            start = time.time()
+
+            add("waiting", 1)
+            slots.acquire()
+            add("waiting", -1)
+            add("running", 1)
+            try:
+                time.sleep(LATENCY * random.uniform(0.8, 1.2))
+            finally:
+                add("running", -1)
+                slots.release()
+
+            add("success", 1)
+            add("latency_sum", time.time() - start)
+            self.send(200, json.dumps({
+                "model": MODEL,
+                "hostname": os.environ.get("HOSTNAME"),
+                "choices": [{"message": {"role": "assistant", "content": "Hello from mock GPU"}}],
+            }))
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("0.0.0.0", 8000), Handler)
+    server.daemon_threads = True
+    print(f"mock vLLM on :8000 max_num_seqs={MAX_NUM_SEQS} latency={LATENCY}s", flush=True)
+    server.serve_forever()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm
+  namespace: llm
+  labels:
+    app: vllm
+spec:
+  # no "replicas" field: KEDA owns the replica count
+
+  selector:
+    matchLabels:
+      app: vllm
+
+  template:
+    metadata:
+      labels:
+        app: vllm
+
+    spec:
+      nodeSelector:
+        gpu-node: "true"
+
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+
+      containers:
+      - name: mock-vllm
+        image: python:3.12-alpine
+        command: ["python", "-u", "/app/server.py"]
+
+        env:
+        - name: MAX_NUM_SEQS
+          value: "16"
+        - name: REQUEST_LATENCY_SECONDS
+          value: "2"
+        - name: MODEL_NAME
+          value: qwen
+
+        ports:
+        - containerPort: 8000
+
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            memory: 128Mi
+            nvidia.com/gpu: 1
+
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          periodSeconds: 5
+
+        volumeMounts:
+        - name: app
+          mountPath: /app
+
+      volumes:
+      - name: app
+        configMap:
+          name: mock-vllm
