@@ -353,3 +353,7 @@ are more components to maintain.
 | GPU | [Scheduling GPUs](https://kubernetes.io/docs/tasks/manage-gpus/scheduling-gpus/) · [Extended resources (fake GPU)](https://kubernetes.io/docs/tasks/administer-cluster/extended-resource-node/) · [GKE GPUs](https://cloud.google.com/kubernetes-engine/docs/how-to/gpus) · [NVIDIA GPU Operator](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/) · [DCGM exporter](https://github.com/NVIDIA/dcgm-exporter) · [vLLM metrics](https://docs.vllm.ai/en/latest/serving/metrics.html) |
 | Tools | [k3s](https://docs.k3s.io/) · [Helm](https://helm.sh/docs/) · [Traefik ingress](https://doc.traefik.io/traefik/providers/kubernetes-ingress/) · [kubectl cheat sheet](https://kubernetes.io/docs/reference/kubectl/cheatsheet/) · [k6](https://grafana.com/docs/k6/latest/) |
 | Cost | [FinOps framework](https://www.finops.org/framework/) · [KEDA blog](https://keda.sh/blog/) · [CNCF landscape](https://landscape.cncf.io/) |
+
+## License
+
+MIT. See [LICENSE](LICENSE).
